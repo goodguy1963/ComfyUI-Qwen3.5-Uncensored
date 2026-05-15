@@ -3,7 +3,7 @@
   "name": "QwenVL-Mod: Enhanced Vision-Language",
   "description": "Enhanced QwenVL node with Flash Attention 2, WAN 2.2 video generation, free abliterated models, and comprehensive NSFW support. Advanced fork with major improvements over original for stable multimodal AI workflows.",
   "author": "huchukato",
-  "version": "2.0.4",
+  "version": "2.2.5-local-locked",
   "url": "https://github.com/huchukato/ComfyUI-QwenVL-Mod",
   "category": "image"
 }
@@ -31,6 +31,8 @@ def load_modules_from_directory(directory):
 
             try:
                 spec = importlib.util.spec_from_file_location(module_name, file_path)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Unable to create import spec for {module_name}")
                 module = importlib.util.module_from_spec(spec)
                 sys.modules[module_name] = module
                 spec.loader.exec_module(module)
