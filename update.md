@@ -1,5 +1,122 @@
 # ComfyUI-QwenVL Update Log
 
+## Version 2.2.5-local-locked (2026/05/14) — Complete Feature Parity
+
+### 🎯 All 6 Nodes Now Have:
+- **Live Terminal Streaming** (`stream_tokens_to_terminal` toggle)
+- **RAW_TRACE** second STRING output
+- **Per-Node Prompt Persistence** (survives restarts)
+- **enable_thinking** toggle (Qwen & non-Qwen with prefill steering)
+- **ComfyUI Interrupt Support** (stops within one token)
+- **Hidden identity wiring** for workflow-scoped state
+
+### 📦 Model Registry Updates
+- **Gemma 4 HF entries**: All 7 variants (E2B, E4B, 26B, 31B, +3 uncensored/heretic)
+- **Gemma 4 GGUF entries**: 6 text-only GGUF variants in Qwen_model catalog
+- **[DL, VRAM] brackets** on every hf_models.json entry
+- **[Q4 size | Q8 size | VRAM] brackets** on Gemma GGUF entries
+
+### 🔒 Fork Lock
+- **Git origin** neutered to `file:///nonexistent/...` — ComfyUI Manager cannot fetch
+- **.no_auto_update** sentinel file for belt-and-suspenders protection
+
+## Version 2.2.5-local (2026/05/14) — Gemma 4 Support, Thinking Toggle, Interrupt
+
+### ⏹️ ComfyUI Interrupt Support
+- **Instant Stop**: All Qwen nodes now check `comfy.model_management.throw_exception_if_processing_interrupted()`
+  inside every streaming token loop and after every blocking generation call.
+- **Streaming Loops**: GGUF chunk iteration and HF TextIteratorStreamer loops check interrupt
+  on every iteration, so generation stops within one token/chunk of hitting the Interrupt button.
+- **Non-Streaming Paths**: Blocking `generate()` calls are followed by an interrupt check,
+  so the node yields as soon as the model call returns.
+- **OOM Retry Path**: The shared HF path checks interrupt after each generation attempt,
+  including the reduced-token retry and CPU fallback.
+- **Consistent Across All Nodes**: GGUF enhancer, HF enhancer, GGUF VL, HF VL, and
+  Advanced variants all respect the Interrupt button.
+
+### 🖥️ Live Terminal Token Streaming
+- **New Widget**: `stream_tokens_to_terminal` boolean (default False) on ALL six
+  node types prints tokens live to the ComfyUI terminal.
+- **GGUF Path**: Uses llama-cpp-python `stream=True` with chunked iteration.
+- **HF Path**: Uses HuggingFace `TextIteratorStreamer` with background thread.
+- **Stage Delimiters**: Generation, retry, and translation stages are clearly labelled.
+
+### 📝 RAW_TRACE Output
+- **Second STRING Output**: ALL six node types now expose `RAW_TRACE`
+  alongside the existing output (ENHANCED_OUTPUT or RESPONSE).
+- **Full History**: RAW_TRACE contains the uncleaned generation chain
+  (initial generation, optional retry, optional translation) before stripping.
+- **Existing Output Unchanged**: ENHANCED_OUTPUT / RESPONSE remains the
+  cleaned text as before — existing workflows keep working.
+
+### 🔒 Auto-Update Lock (from 2.2.3-local)
+- **Git Remote Neutered**: Origin URL changed to `file:///nonexistent/...` so
+  ComfyUI Manager's `git fetch` fails silently.
+- **Version Bumped**: `pyproject.toml` version set to `2.2.3-local` for
+  visual identification.
+- **To Re-Enable Updates**: Manually restore the original remote URL in
+  `.git/config` before running Manager update.
+
+## Version 2.2.3-local (2026/05/13) — Per-Node Prompt Persistence
+- **Per-Node State**: Replaced shared module-global `LAST_SAVED_PROMPT` with per-node
+  state keyed by workflow identity + ComfyUI node unique_id.
+- **Restart-Safe**: Prompts survive ComfyUI idle, Python module reload, full restart,
+  and workflow save/reload via `node_prompt_state.json`.
+- **No Cross-Contamination**: Multiple enhancer (or other Qwen) nodes in the same
+  workflow each keep their own saved prompt independently.
+- **Migrated ALL Nodes**: QwenVL, QwenVL Advanced, QwenVL GGUF, QwenVL GGUF Advanced,
+  QwenVL Prompt Enhancer, and QwenVL Prompt Enhancer GGUF all use per-node state.
+
+### ⏹️ ComfyUI Interrupt Support
+- **Instant Stop**: All Qwen nodes now check `comfy.model_management.throw_exception_if_processing_interrupted()`
+  inside every streaming token loop and after every blocking generation call.
+- **Streaming Loops**: GGUF chunk iteration and HF TextIteratorStreamer loops check interrupt
+  on every iteration, so generation stops within one token/chunk of hitting the Interrupt button.
+- **Non-Streaming Paths**: Blocking `generate()` calls are followed by an interrupt check,
+  so the node yields as soon as the model call returns.
+- **OOM Retry Path**: The shared HF path checks interrupt after each generation attempt,
+  including the reduced-token retry and CPU fallback.
+- **Consistent Across All Nodes**: GGUF enhancer, HF enhancer, GGUF VL, HF VL, and
+  Advanced variants all respect the Interrupt button.
+
+### 🖥️ Live Terminal Token Streaming
+- **New Widget**: `stream_tokens_to_terminal` boolean (default False) on ALL six
+  node types prints tokens live to the ComfyUI terminal.
+- **Readable Progress Output**: Terminal now prints buffered, human-readable chunks
+  instead of repainting a fast-moving token tail.
+- **GGUF Path**: Uses llama-cpp-python `stream=True` with chunked iteration.
+- **HF Path**: Uses HuggingFace `TextIteratorStreamer` with background thread.
+- **Stage Delimiters**: Generation, retry (if triggered), and translation stages
+  are clearly labelled in terminal output for Prompt Enhancer nodes.
+- **Completion Summaries**: Each streamed phase ends with a short timing/update
+  summary so the terminal stays useful for debugging without turning into noise.
+
+### 📝 RAW_TRACE Output
+- **Second STRING Output**: ALL six node types now expose `RAW_TRACE` alongside
+  the existing output. Prompt Enhancers: `ENHANCED_OUTPUT` + `RAW_TRACE`.
+  Vision+Language nodes: `RESPONSE` + `RAW_TRACE`.
+- **Full History**: RAW_TRACE contains the uncleaned chronological generation
+  chain (initial generation, optional retry, optional translation) before any
+  `clean_model_output()` stripping.
+- **Existing Output Unchanged**: `ENHANCED_OUTPUT` / `RESPONSE` remains the
+  cleaned text as before — existing workflows keep working.
+
+### 🔄 Automatic Prompt Save on Fixed Seed
+- **No Checkbox Needed**: When a fixed seed is used, generated prompts are
+  automatically persisted to per-node state without requiring `keep_last_prompt`.
+- **`keep_last_prompt` Optional**: The toggle still exists for explicit control
+  (skip generation, return saved), but auto-save works independently of it.
+
+### 🔒 Local Fork Lock
+- **Git Remote Neutered**: Origin URL changed to `file:///nonexistent/...` so
+  ComfyUI Manager's `git fetch` fails silently and no update is flagged.
+- **Version Bumped**: `pyproject.toml` version set to `2.2.3-local` for
+  visual identification.
+- **To Re-Enable Updates**: Manually restore the original remote URL in
+  `.git/config` before running Manager update.
+
+---
+
 ## Version 2.2.4 (2026/03/13)
 
 🎬 **Critical I2V Timeline Fixes & NSFW Presets Optimization**
@@ -258,7 +375,7 @@ This update refines the prompt persistence feature with a more intuitive paramet
 - **Consistent Logic**: Unified behavior across all 6 nodes (HF, GGUF, PromptEnhancer variants)
 - **Workflow Optimization**: Generate once, preserve results while changing inputs
 - **Zero Resource Usage**: Cached mode provides instant responses without model loading
-- **Smart Caching**: LAST_SAVED_PROMPT global variable for efficient prompt reuse
+- **Smart Caching**: Per-node prompt state via NODE_PROMPT_STATE backed by node_prompt_state.json for durable per-node prompt persistence
 
 ### 🔥 Enhanced NSFW Support
 - **Stronger Instructions**: Changed "If" to "WHEN" for more directive NSFW handling
@@ -294,10 +411,11 @@ This update refines the prompt persistence feature with a more intuitive paramet
 - **Bug Fixes**: Resolved TypeError issues in Advanced nodes
 
 ### 🔄 How Keep Last Prompt Works
-1. **Generate Phase** (`keep_last_prompt=False`): Generate new prompt and save to memory
-2. **Keep Phase** (`keep_last_prompt=True`): Return the last saved prompt from memory
-3. **First Run**: If no previous prompt exists, returns empty string
-4. **Memory Update**: Each generation overwrites the previous saved prompt
+1. **Generate Phase** (`keep_last_prompt=False`): Generate new prompt and save to per-node state (survives idle, module reload, and ComfyUI restart).
+2. **Keep Phase** (`keep_last_prompt=True`): Return the per-node saved prompt for the specific node instance only.
+3. **First Run**: If no per-node prompt exists, returns empty string.
+4. **Per-Node Isolation**: Each Qwen node stores its own prompt independently. Multiple enhancer nodes in one workflow will not overwrite each other.
+5. **RAW_TRACE Output**: Prompt Enhancer nodes now expose a second STRING output containing the full uncleaned generation trace (initial generation, retry if triggered, translation if enabled).
 
 ### 🐛 Bug Fixes
 - **Fixed TypeError**: Resolved "unexpected keyword argument" errors in Advanced nodes
