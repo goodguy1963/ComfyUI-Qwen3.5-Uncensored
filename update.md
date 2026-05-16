@@ -194,16 +194,16 @@ This update removes redundant memory management features and improves CUDA 13 co
 |- **VRAM Cleanup Node**: Maintained for manual cleanup when needed
 
 ### 🐛 **Bug Fixes**
-|- **VastAI CUDA 13**: Fixed crashes caused by conflicting unload operations
-|- **WanMoeKSampler**: Manual boundary setting prevents automatic switching crashes
-|- **Memory Conflicts**: Eliminated double cleanup between QwenVL and VRAM Cleanup nodes
-|- **Parameter Errors**: Fixed "missing 1 required positional argument: unload_after_run" errors
-|- **Function Signatures**: Corrected all run() and load_model() function signatures
+- **VastAI CUDA 13**: Fixed crashes caused by conflicting unload operations
+- **WanMoeKSampler**: Manual boundary setting prevents automatic switching crashes
+- **Memory Conflicts**: Eliminated double cleanup between QwenVL and VRAM Cleanup nodes
+- **Parameter Errors**: Fixed "missing 1 required positional argument: unload_after_run" errors
+- **Function Signatures**: Corrected all run() and load_model() function signatures
 
 ### 📚 **Documentation Updates**
-|- **All READMEs**: Updated to reflect unload_after_run removal
-|- **Installation Guides**: Simplified instructions without redundant parameters
-|- **Troubleshooting**: Added CUDA 13 specific guidance
+- **All READMEs**: Updated to reflect unload_after_run removal
+- **Installation Guides**: Simplified instructions without redundant parameters
+- **Troubleshooting**: Added CUDA 13 specific guidance
 
 ### 🏆 Credits & Attribution
 |- **Community Feedback**: Thanks to user testing that identified redundancy issue
