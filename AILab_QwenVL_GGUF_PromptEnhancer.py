@@ -11,29 +11,250 @@
 # Source: https://github.com/1038lab/ComfyUI-QwenVL
 
 import base64
+import ctypes
 import gc
 import hashlib
+import importlib
 import json
 import os
+import queue
 import re
+import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
-from llama_cpp import Llama
+from llama_cpp import Llama  # type: ignore[import-untyped]
 
 import folder_paths
 from AILab_OutputCleaner import OutputCleanConfig, clean_model_output, prompt_output_guard
+from comfy.model_management import throw_exception_if_processing_interrupted
+from comfy.model_management import throw_exception_if_processing_interrupted
 
 # Import cache functions from main module
 import sys
 sys.path.append(str(Path(__file__).parent))
-from AILab_QwenVL import PROMPT_CACHE, ensure_cuda_vram_headroom, get_cache_key, get_alternative_cache_key, save_prompt_cache
-from AILab_QwenVL_GGUF import read_gguf_architecture
+from AILab_StreamDisplay import TerminalStreamDisplay
+from AILab_QwenVL import (
+    PROMPT_CACHE,
+    apply_qwen_soft_thinking_directive,
+    build_node_input_signature,
+    ensure_cuda_vram_headroom,
+    estimate_qwen_text_tokens,
+    get_cache_key,
+    get_alternative_cache_key,
+    save_prompt_cache,
+    get_node_saved_prompt,
+    get_node_saved_prompt_with_seed,
+    resolve_qwen_thinking_mode,
+    set_node_saved_prompt,
+    load_node_prompt_state,
+    _make_node_state_key,
+    _build_workflow_fingerprint,
+)
+from AILab_QwenVL_GGUF import read_gguf_architecture, register_active_gguf_loader, release_other_gguf_loaders
 
-# Simple global variable to store last generated prompt
+
+def _parse_repo_quant_sizes(repo_key: str) -> dict[str, str] | None:
+    """Parse bracket info from repo key like 'Gemma-4-E4B-it-GGUF [Q4:5.4GB|Q8:8GB|VRAM:~7GB]'.
+    Returns a dict mapping quant names to size strings, or None if no bracket info."""
+    import re
+    match = re.search(r'\[([^\]]+)\]', repo_key)
+    if not match:
+        return None
+    sizes: dict[str, str] = {}
+    for part in match.group(1).split('|'):
+        part = part.strip()
+        if ':' in part:
+            k, v = part.split(':', 1)
+            sizes[k.strip()] = v.strip()
+    return sizes if sizes else None
+
+
+def _quant_from_filename(filename: str) -> str | None:
+    """Extract quantization level from a GGUF filename stem.
+    E.g. 'gemma-4-E4B-it-Q4_K_M.gguf' -> 'Q4'."""
+    from pathlib import Path
+    name = Path(filename).stem.upper()
+    for q in ('BF16', 'F16', 'F32', 'Q8_0', 'Q6_K', 'Q5_K_M', 'Q5_K_S', 'Q4_K_M', 'Q4_K_S', 'Q3_K_M', 'Q2_K'):
+        if q in name:
+            return _QUANT_CANONICAL.get(q, q)
+    return None
+
+_QUANT_CANONICAL = {
+    'BF16': 'BF16', 'F16': 'F16', 'F32': 'F32',
+    'Q8_0': 'Q8', 'Q6_K': 'Q6',
+    'Q5_K_M': 'Q5', 'Q5_K_S': 'Q5',
+    'Q4_K_M': 'Q4', 'Q4_K_S': 'Q4',
+    'Q3_K_M': 'Q3', 'Q2_K': 'Q2',
+}
+
+_EMPTY_THINK_RE = re.compile(r"<think[^>]*>\s*</think>", flags=re.IGNORECASE | re.DOTALL)
+_STREAM_HEARTBEAT_INTERVAL_SECONDS = 3.0
+_PROMPT_ENHANCER_MAX_FINALIZATION_ATTEMPTS = 3
+_STREAM_POLL_INTERVAL_SECONDS = 0.25
+
+
+def _looks_like_prompt_planning(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?\s*(okay[,.:]?|first[,.:]?|next[,.:]?|then[,.:]?|wait[,.:]?|final\s+plan|final\s+check)\b",
+            text,
+        )
+        or re.search(r"(?i)\b(i\s+(should|need|must|will|am\s+going\s+to|have\s+to))\b", text)
+    )
+
+
+def _prompt_output_is_usable(cleaned_text: str) -> bool:
+    return bool(cleaned_text and not _looks_like_prompt_planning(cleaned_text))
+
+
+def _maybe_emit_prompt_stream_heartbeat(stage_label: str, started_at: float, last_status_at: float, full_text: str) -> float:
+    now = time.monotonic()
+    if (now - last_status_at) < _STREAM_HEARTBEAT_INTERVAL_SECONDS:
+        return last_status_at
+    cleaned_preview = clean_model_output(full_text, OutputCleanConfig(mode="prompt"))
+    if _prompt_output_is_usable(cleaned_preview):
+        return now
+    elapsed = max(0.0, now - started_at)
+    print(f"[QwenVL GGUF] {stage_label}: reasoning hidden; still generating... ({len(full_text)} chars, {elapsed:.1f}s)")
+    return now
+
+
+def _maybe_emit_prompt_waiting_heartbeat(stage_label: str, started_at: float, last_status_at: float) -> float:
+    now = time.monotonic()
+    if (now - last_status_at) < _STREAM_HEARTBEAT_INTERVAL_SECONDS:
+        return last_status_at
+    print("[QwenVL GGUF] waiting for first streamed chunk...")
+    return now
+
+
+def _compact_progress_line_width(limit: int = 60) -> int:
+    terminal_half_width = max(24, shutil.get_terminal_size(fallback=(120, 20)).columns // 2)
+    return max(24, min(int(limit), terminal_half_width))
+
+
+def _normalize_compact_progress_text(text: str) -> str:
+    return re.sub(r"[ \t]+", " ", (text or "").replace("\r", "").replace("\n", " ")).strip()
+
+
+def _split_compact_progress_lines(text: str, line_width: int) -> tuple[list[str], str]:
+    lines: list[str] = []
+    remaining = text.lstrip()
+    while len(remaining) > line_width:
+        split_at = remaining.rfind(" ", 0, line_width + 1)
+        if split_at <= 0:
+            split_at = line_width
+        line = remaining[:split_at].strip()
+        if line:
+            lines.append(line)
+        remaining = remaining[split_at:].lstrip()
+    return lines, remaining
+
+
+def _maybe_emit_prompt_compact_progress(stage_label: str, started_at: float, last_status_at: float, full_text: str, progress_state: dict, *, force: bool = False, final: bool = False) -> float:
+    now = time.monotonic()
+    if not final and not force and (now - last_status_at) < _STREAM_HEARTBEAT_INTERVAL_SECONDS:
+        return last_status_at
+    rendered_text = _normalize_compact_progress_text(clean_model_output(full_text, OutputCleanConfig(mode="prompt")) or full_text)
+    if not rendered_text:
+        print("[QwenVL GGUF] generating...")
+        return now
+
+    line_width = int(progress_state.get("line_width") or _compact_progress_line_width())
+    progress_state["line_width"] = line_width
+    previous_snapshot = progress_state.get("rendered_snapshot", "")
+    pending_text = progress_state.get("pending_text", "")
+    if previous_snapshot and rendered_text.startswith(previous_snapshot):
+        delta = rendered_text[len(previous_snapshot):]
+        pending_text = f"{pending_text}{delta}"
+    else:
+        pending_text = rendered_text
+    progress_state["rendered_snapshot"] = rendered_text
+
+    lines, pending_text = _split_compact_progress_lines(pending_text, line_width)
+    emitted = False
+    for line in lines:
+        print(line)
+        emitted = True
+    if final and pending_text:
+        print(pending_text)
+        pending_text = ""
+        emitted = True
+    progress_state["pending_text"] = pending_text
+
+    if emitted or final:
+        return now
+    return last_status_at
+
+
+def _install_llama_abort_callback(llm, should_abort):
+    try:
+        llama_cpp_lib = importlib.import_module("llama_cpp.llama_cpp")
+    except Exception:
+        return None
+
+    ctx = getattr(llm, "ctx", None)
+    if ctx is None:
+        ctx_holder = getattr(llm, "_ctx", None)
+        ctx = getattr(ctx_holder, "ctx", None)
+    callback_type = getattr(llama_cpp_lib, "ggml_abort_callback", None)
+    set_abort_callback = getattr(llama_cpp_lib, "llama_set_abort_callback", None)
+    if ctx is None or callback_type is None or set_abort_callback is None:
+        return None
+
+    def _active_callback(_):
+        return bool(should_abort())
+
+    def _inactive_callback(_):
+        return False
+
+    active_cb = callback_type(_active_callback)
+    inactive_cb = callback_type(_inactive_callback)
+    try:
+        set_abort_callback(ctx, active_cb, ctypes.c_void_p())
+    except Exception:
+        return None
+
+    def _clear_callback():
+        try:
+            set_abort_callback(ctx, inactive_cb, ctypes.c_void_p())
+        except Exception:
+            pass
+
+    return active_cb, inactive_cb, _clear_callback
+
+
+def _describe_prompt_enhancer_thinking(requested_thinking: bool, effective_thinking: bool, raw_text: str, *, retried: bool = False) -> str:
+    raw = raw_text or ""
+    raw_lower = raw.lower()
+    if requested_thinking and not effective_thinking:
+        raw_state = "budget_disabled"
+    elif not requested_thinking:
+        raw_state = "disabled"
+    elif _EMPTY_THINK_RE.search(raw):
+        raw_state = "think_empty"
+    elif "<think" in raw_lower:
+        raw_state = "think_present"
+    else:
+        raw_state = "think_hidden_or_absent"
+    terminal_state = "off" if not effective_thinking else "hidden"
+    pass_state = "retry" if retried else "single_pass"
+    return (
+        f"requested={bool(requested_thinking)} effective={bool(effective_thinking)} "
+        f"raw={raw_state} terminal_reasoning={terminal_state} final_output=clean_prompt pass={pass_state}"
+    )
+
+
+# DEPRECATED: use per-node state via get_node_saved_prompt / set_node_saved_prompt instead.
 LAST_SAVED_PROMPT = None
+
+# Load per-node state at startup so keep_last_prompt works across restarts
+load_node_prompt_state()
 
 NODE_DIR = Path(__file__).parent
 GGUF_CONFIG_PATH = NODE_DIR / "gguf_models.json"
@@ -89,9 +310,23 @@ def _model_name_to_filename_candidates(model_name: str) -> set[str]:
     return candidates
 
 
+def _find_existing_local_file(base_dir: Path, filename: str) -> Path | None:
+    """Reuse an already-downloaded GGUF file anywhere under the shared base dir."""
+    wanted = Path(filename).name
+    if not wanted:
+        return None
+    try:
+        for candidate in base_dir.rglob(wanted):
+            if candidate.is_file():
+                return candidate
+    except Exception:
+        return None
+    return None
+
+
 class AILab_QwenVL_GGUF_PromptEnhancer:
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("ENHANCED_OUTPUT",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("ENHANCED_OUTPUT", "RAW_TRACE")
     FUNCTION = "process"
     CATEGORY = "Qwen3.5-Uncensored"
 
@@ -100,6 +335,7 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         self.current_signature = None
         self.gguf_models = self.load_gguf_models()
         self.styles = STYLES
+        register_active_gguf_loader(self)
 
     @staticmethod
     def _scan_local_gguf_text_models(base_dir: Path, existing_filenames: set[str]) -> dict[str, dict]:
@@ -166,13 +402,19 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
                     continue
                 author = repo.get("author") or repo.get("publisher")
                 repo_name = repo.get("repo_name") or repo.get("repo_name_override") or repo_key
-                defaults = repo.get("defaults") if isinstance(repo.get("defaults"), dict) else {}
+                _defaults_raw = repo.get("defaults")
+                defaults: dict = _defaults_raw if isinstance(_defaults_raw, dict) else {}
                 repo_id = repo.get("repo_id")
                 alt_repo_ids = repo.get("alt_repo_ids") or []
                 model_files = repo.get("model_files") or []
+                quant_sizes = _parse_repo_quant_sizes(repo_key)
                 for model_file in model_files:
                     # Prefer short names in UI: just the filename.
                     display = Path(model_file).name
+                    if quant_sizes:
+                        q = _quant_from_filename(model_file)
+                        if q and q in quant_sizes:
+                            display = f"{display} [~{quant_sizes[q]}]"
                     if display in seen_display_names:
                         display = f"{display} ({repo_key})"
                     seen_display_names.add(display)
@@ -233,7 +475,13 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": "Keep model loaded in memory for faster repeated inference (uses more VRAM)."}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
                 "keep_last_prompt": ("BOOLEAN", {"default": False, "tooltip": "Keep the last generated prompt instead of creating a new one"}),
-                            }
+                "stream_tokens_to_terminal": ("BOOLEAN", {"default": False, "tooltip": "Show readable generation progress and thinking-status summaries in the ComfyUI terminal. When enabled, fixed-seed and prompt-cache reuse are bypassed so a fresh streamed run can occur."}),
+                "enable_thinking": ("BOOLEAN", {"default": True, "tooltip": "Enable model reasoning/thinking when the backend supports it: True=allow thinking, False=force direct answer. Even when enabled, easy prompts may still get a direct answer, and this node automatically disables thinking when there is not enough output budget left for useful reasoning. Prompt enhancers still return a cleaned final prompt, so terminal reasoning may be hidden or empty."}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
         }
 
     def clear(self):
@@ -302,8 +550,20 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             author = _safe_dirname(str(entry.get("author") or entry.get("publisher") or ""))
             repo_dir = _safe_dirname(str(entry.get("repo_dirname") or model_name))
             if author and author != "unknown":
-                return base_dir / author / repo_dir / Path(filename).name
-            return base_dir / repo_dir / Path(filename).name
+                target = base_dir / author / repo_dir / Path(filename).name
+            else:
+                target = base_dir / repo_dir / Path(filename).name
+            if target.exists():
+                return target
+            existing = _find_existing_local_file(base_dir, filename)
+            if existing is not None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    target.hardlink_to(existing)
+                    return target
+                except Exception:
+                    return existing
+            return target
 
         return base_dir / model_name
 
@@ -367,15 +627,17 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         if not resolved.exists():
             raise FileNotFoundError(f"[QwenVL] GGUF model not found after download: {resolved} (tried: {', '.join(attempted)})")
 
-    def _load_model(self, model_name, device):
+    def _load_model(self, model_name, device, enable_thinking=True):
         resolved = self._resolve_model_path(model_name)
         self._maybe_download_model(model_name, resolved)
         model_cfg = self.gguf_models["models"].get(model_name, {})
         context_length = model_cfg.get("context_length", 32768)
-        signature = (resolved, context_length, device)
+        signature = (resolved, context_length, device, bool(enable_thinking))
         if self.llm is not None and self.current_signature == signature:
             ensure_cuda_vram_headroom("QwenVL PromptEnhancer GGUF", min_free_gb=1.0, min_free_ratio=0.08)
             return
+
+        release_other_gguf_loaders(self, resolved.name)
         
         # Force aggressive cleanup before loading new model (especially for same model conflicts)
         print(f"[QwenVL PromptEnhancer DEBUG] Forcing cleanup before model loading...")
@@ -406,13 +668,30 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             "verbose": False,
             "chat_format": "qwen",
         }
+        self.current_context_length = context_length
 
         # Detect architecture from GGUF metadata instead of relying on model name
         arch = read_gguf_architecture(resolved)
-        is_qwen35 = arch in ("qwen35", "qwen35moe") if arch else "qwen3.5-" in model_name.lower()
-        if is_qwen35:
-            kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-            print(f"[QwenVL] Qwen3.5 detected (arch={arch}): Disabling thinking in chat template.")
+        self.gguf_arch = arch
+        is_qwen = (arch and any(a in arch for a in ("qwen35", "qwen35moe", "qwen3", "qwen"))) or "qwen3.5-" in model_name.lower() or "qwen3-" in model_name.lower()
+        self.supports_qwen_soft_think = arch == "qwen3" if arch else "qwen3-" in model_name.lower()
+        if is_qwen:
+            thinking_state = bool(enable_thinking)
+            kwargs["chat_template_kwargs"] = {"enable_thinking": thinking_state}
+            state_label = "enabled" if thinking_state else "disabled"
+            print(f"[QwenVL] Qwen architecture detected (arch={arch}): Thinking {state_label} via chat template.")
+        else:
+            thinking_state = bool(enable_thinking)
+            if not thinking_state:
+                # Prefill steering: seed the assistant response with a direct-answer phrase
+                # to push models that ignore enable_thinking toward direct output.
+                kwargs["chat_template_kwargs"] = kwargs.get("chat_template_kwargs", {})
+                kwargs["chat_template_kwargs"]["prefill"] = (
+                    "I'll answer directly without any analysis or thinking:\n\n"
+                )
+                print(f"[QwenVL] Non-Qwen architecture (arch={arch}): Thinking OFF — prefill steering applied.")
+            else:
+                print(f"[QwenVL] Non-Qwen architecture (arch={arch}): Thinking ON (advisory — backend may ignore).")
 
         self.llm = Llama(**kwargs)
         self.current_signature = signature
@@ -426,46 +705,165 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         top_p,
         repetition_penalty,
         seed,
+        stream_to_terminal=False,
+        initial_stage_label="INITIAL GENERATION",
+        enable_thinking=True,
     ):
-        def _looks_like_planning(text: str) -> bool:
-            if not text:
-                return False
-            return bool(
-                re.search(
-                    r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?\s*(okay[,.:]?|first[,.:]?|next[,.:]?|then[,.:]?|wait[,.:]?|final\s+plan|final\s+check)\b",
-                    text,
-                )
-                or re.search(r"(?i)\b(i\s+(should|need|must|will|am\s+going\s+to|have\s+to))\b", text)
-            )
+        """Returns (cleaned_prompt, raw_trace) tuple."""
+        stream_display = TerminalStreamDisplay("QwenVL GGUF", suppress_planning=True, compact=False) if stream_to_terminal else None
+        supports_soft_think = getattr(self, "supports_qwen_soft_think", False)
+        if supports_soft_think:
+            directive = "/think" if enable_thinking else "/no_think"
+            print(f"[QwenVL] Qwen3 GGUF prompt enhancer: Thinking {'enabled' if enable_thinking else 'disabled'} via chat template and {directive}.")
 
-        def _call(system: str, user: str, temp: float, seed_val: int) -> str:
+        def _call(
+            system: str,
+            user: str,
+            temp: float,
+            seed_val: int,
+            stage_label: str,
+            *,
+            attempt_enable_thinking: bool | None = None,
+        ) -> str:
+            current_enable_thinking = enable_thinking if attempt_enable_thinking is None else bool(attempt_enable_thinking)
+            effective_user_prompt = apply_qwen_soft_thinking_directive(
+                user,
+                current_enable_thinking,
+                supports_soft_switch=supports_soft_think,
+            )
             ensure_cuda_vram_headroom("QwenVL PromptEnhancer GGUF", min_free_gb=1.0, min_free_ratio=0.08)
             if self.llm is not None and hasattr(self.llm, "reset"):
                 try:
                     self.llm.reset()
                 except Exception as exc:
                     print(f"[QwenVL PromptEnhancer DEBUG] llama context reset skipped: {exc}")
-            response = self.llm.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                max_tokens=max_tokens,
-                temperature=temp,
-                top_p=top_p,
-                repeat_penalty=repetition_penalty,
-                seed=seed_val,
-            )
-            if not response or "choices" not in response or not response["choices"]:
-                raise RuntimeError("[QwenVL] llama_cpp returned empty response")
-            return (response["choices"][0].get("message", {}).get("content", "") or "").strip()
+            llm = self.llm
+            if llm is None:
+                raise RuntimeError("[QwenVL] GGUF model is not loaded")
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": effective_user_prompt},
+            ]
+            full_text = ""
+            stage_started_at = time.monotonic()
+            last_status_at = stage_started_at
+            compact_progress_state = {"rendered_snapshot": "", "pending_text": ""}
+            if stream_to_terminal:
+                if stream_display is None:
+                    raise RuntimeError("[QwenVL] Stream display was not initialized")
+                print(f"[QwenVL PromptEnhancer GGUF] STREAMING {stage_label}")
+                stream_display.start_stage(stage_label)
+            abort_requested = threading.Event()
+            abort_callback_refs = _install_llama_abort_callback(llm, abort_requested.is_set)
+            result_queue: queue.Queue[tuple[str, dict | BaseException | None]] = queue.Queue()
 
-        raw = _call(system_prompt, user_prompt, float(temperature), int(seed))
+            def _stream_worker():
+                try:
+                    response = llm.create_chat_completion(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temp,
+                        top_p=top_p,
+                        repeat_penalty=repetition_penalty,
+                        seed=seed_val,
+                        stop=["<|im_end|>", "<|im_start|>"],
+                        stream=True,
+                    )
+                    for chunk in response:
+                        result_queue.put(("chunk", chunk))
+                    result_queue.put(("done", None))
+                except BaseException as exc:
+                    result_queue.put(("error", exc))
+
+            worker = threading.Thread(target=_stream_worker, name=f"QwenGGUFPrompt-{stage_label}", daemon=True)
+            worker.start()
+            try:
+                while True:
+                    try:
+                        kind, payload = result_queue.get(timeout=_STREAM_POLL_INTERVAL_SECONDS)
+                    except queue.Empty:
+                        try:
+                            throw_exception_if_processing_interrupted()
+                        except Exception:
+                            abort_requested.set()
+                            raise
+                        if full_text:
+                            if stream_display is not None:
+                                last_status_at = _maybe_emit_prompt_stream_heartbeat(stage_label, stage_started_at, last_status_at, full_text)
+                            else:
+                                last_status_at = _maybe_emit_prompt_compact_progress(stage_label, stage_started_at, last_status_at, full_text, compact_progress_state)
+                        else:
+                            last_status_at = _maybe_emit_prompt_waiting_heartbeat(stage_label, stage_started_at, last_status_at)
+                        continue
+
+                    if kind == "chunk":
+                        throw_exception_if_processing_interrupted()
+                        chunk = payload if isinstance(payload, dict) else {}
+                        token = (
+                            chunk.get("choices", [{}])[0]
+                            .get("delta", {})
+                            .get("content", "")
+                        )
+                        if token:
+                            had_text_before = bool(full_text)
+                            full_text += token
+                            if stream_display is not None:
+                                stream_display.push(token)
+                                last_status_at = _maybe_emit_prompt_stream_heartbeat(stage_label, stage_started_at, last_status_at, full_text)
+                            else:
+                                last_status_at = _maybe_emit_prompt_compact_progress(
+                                    stage_label,
+                                    stage_started_at,
+                                    last_status_at,
+                                    full_text,
+                                    compact_progress_state,
+                                    force=not had_text_before,
+                                )
+                        continue
+
+                    if kind == "done":
+                        break
+
+                    if kind == "error":
+                        if isinstance(payload, BaseException):
+                            raise payload
+                        raise RuntimeError(f"[QwenVL] llama_cpp streaming failed: {payload!r}")
+            finally:
+                abort_requested.set()
+                worker.join(timeout=1.0)
+                if abort_callback_refs is not None:
+                    _, _, clear_abort_callback = abort_callback_refs
+                    clear_abort_callback()
+                if stream_display is not None:
+                    stream_display.end_stage()
+                elif full_text:
+                    _maybe_emit_prompt_compact_progress(
+                        stage_label,
+                        stage_started_at,
+                        last_status_at,
+                        full_text,
+                        compact_progress_state,
+                        final=True,
+                    )
+            if not full_text.strip():
+                raise RuntimeError("[QwenVL] llama_cpp streaming returned empty response")
+            return full_text.strip()
+
+        raw = _call(system_prompt, user_prompt, float(temperature), int(seed), initial_stage_label)
         cleaned = clean_model_output(raw, OutputCleanConfig(mode="prompt"))
+        raw_trace_parts = [f"[{initial_stage_label}]\n{raw}"]
+        best_cleaned = cleaned.strip()
+        if _prompt_output_is_usable(best_cleaned):
+            return best_cleaned, "\n\n".join(raw_trace_parts)
 
-        # If the model only emitted thinking/planning (common with some Qwen variants),
-        # do a single constrained retry asking for final prompt text only.
-        if not cleaned or _looks_like_planning(cleaned) or "<think" in raw.lower():
+        current_raw = raw
+        for attempt_number in range(2, _PROMPT_ENHANCER_MAX_FINALIZATION_ATTEMPTS + 1):
+            if stream_to_terminal:
+                print(
+                    "[QwenVL PromptEnhancer GGUF] "
+                    f"Finalization attempt {attempt_number}/{_PROMPT_ENHANCER_MAX_FINALIZATION_ATTEMPTS} "
+                    "— prior output was empty or reasoning-only"
+                )
             retry_system = (
                 "You are a professional photography prompt writer.\n"
                 "Output ONLY ONE final photography prompt paragraph.\n"
@@ -474,14 +872,33 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             )
             retry_user = (
                 "Rewrite the following into the final prompt paragraph:\n\n"
-                f"{raw}\n"
+                f"{current_raw}\n"
             )
-            raw_retry = _call(retry_system, retry_user, 0.4, int(seed) + 999)
-            cleaned_retry = clean_model_output(raw_retry, OutputCleanConfig(mode="prompt"))
-            if cleaned_retry and not _looks_like_planning(cleaned_retry):
-                return cleaned_retry
+            force_non_thinking = attempt_number == _PROMPT_ENHANCER_MAX_FINALIZATION_ATTEMPTS
+            stage_label = f"FINALIZATION ATTEMPT {attempt_number}/{_PROMPT_ENHANCER_MAX_FINALIZATION_ATTEMPTS}"
+            raw_retry = _call(
+                retry_system,
+                retry_user,
+                0.4,
+                int(seed) + 999 + attempt_number,
+                stage_label,
+                attempt_enable_thinking=False if force_non_thinking else enable_thinking,
+            )
+            raw_trace_parts.append(f"[{stage_label}]\n{raw_retry}")
+            cleaned_retry = clean_model_output(raw_retry, OutputCleanConfig(mode="prompt")).strip()
+            if cleaned_retry and len(cleaned_retry) >= len(best_cleaned):
+                best_cleaned = cleaned_retry
+            if _prompt_output_is_usable(cleaned_retry):
+                return cleaned_retry, "\n\n".join(raw_trace_parts)
+            current_raw = raw_retry
 
-        return cleaned or ""
+        if stream_to_terminal:
+            print(
+                "[QwenVL PromptEnhancer GGUF] "
+                f"Finalization limit reached ({_PROMPT_ENHANCER_MAX_FINALIZATION_ATTEMPTS}/{_PROMPT_ENHANCER_MAX_FINALIZATION_ATTEMPTS}) "
+                "— returning the best cleaned prompt available"
+            )
+        return best_cleaned or "", "\n\n".join(raw_trace_parts)
 
     def process(
         self,
@@ -498,22 +915,40 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
         keep_model_loaded,
         seed,
         keep_last_prompt,
+        stream_tokens_to_terminal=False,
+        unique_id=None,
+        extra_pnginfo=None,
+        enable_thinking=True,
     ):
-        global LAST_SAVED_PROMPT
-        
-        # Simple keep last prompt logic
-        if keep_last_prompt:  # Keep last prompt enabled
-            print(f"[QwenVL PromptEnhancer GGUF] Keep last prompt enabled - using last saved prompt")
-            if LAST_SAVED_PROMPT:
-                print(f"[QwenVL PromptEnhancer GGUF] Using last prompt: {LAST_SAVED_PROMPT[:50]}...")
-                return (LAST_SAVED_PROMPT,)
-            else:
-                print(f"[QwenVL PromptEnhancer GGUF] No previous prompt found, returning empty")
-                return ("",)
-        
-        # Always generate when keep last prompt is disabled
-        print(f"[QwenVL PromptEnhancer GGUF] Keep last prompt disabled - generating new prompt")
-        
+        node_class = "AILab_QwenVL_GGUF_PromptEnhancer"
+        input_signature = build_node_input_signature(
+            model_name=model_name,
+            prompt_text=prompt_text,
+            preset_system_prompt=preset_system_prompt,
+            custom_system_prompt=custom_system_prompt,
+            english_output=bool(english_output),
+            device=device,
+            enable_thinking=bool(enable_thinking),
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+
+        # Auto-retrieve saved prompt when seed is fixed (no keep_last_prompt needed)
+        saved_prompt = get_node_saved_prompt_with_seed(node_class, unique_id, extra_pnginfo, seed=seed, max_tokens=max_tokens, temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty, input_signature=input_signature)
+        if saved_prompt and not stream_tokens_to_terminal:
+            print(f"[QwenVL PromptEnhancer GGUF] Fixed seed {seed} matched — using per-node prompt: {saved_prompt[:50]}...")
+            return (saved_prompt, "")
+        if saved_prompt and stream_tokens_to_terminal:
+            print("[QwenVL PromptEnhancer GGUF] Streaming requested — bypassing fixed-seed prompt reuse for a fresh streamed run")
+        if keep_last_prompt:
+            print(f"[QwenVL PromptEnhancer GGUF] Keep last prompt enabled but no saved prompt found — returning empty")
+            return ("", "")
+
+        # Always generate unless keep_last_prompt was requested
+        print(f"[QwenVL PromptEnhancer GGUF] Generating new prompt")
+
         # Generate cache key with all inputs including seed
         cache_prompt = "\n\n".join(
             part for part in (
@@ -522,15 +957,19 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
                 f"english_output={bool(english_output)}",
             ) if part
         )
-        cache_key = get_cache_key(model_name, preset_system_prompt, cache_prompt, seed=seed)
-        
+        cache_key = get_cache_key(model_name, preset_system_prompt, cache_prompt, seed=seed, max_tokens=max_tokens, temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty)
+
         # Check cache first (only for random mode)
-        if cache_key in PROMPT_CACHE:
+        if cache_key in PROMPT_CACHE and not stream_tokens_to_terminal:
             cached_text = PROMPT_CACHE[cache_key].get("text", "")
             if cached_text:
                 print(f"[QwenVL PromptEnhancer GGUF] Using cached prompt for seed {seed}: {cache_key[:8]}...")
-                return (cached_text.strip(),)
-        
+                return (cached_text.strip(), "")
+        if stream_tokens_to_terminal and cache_key in PROMPT_CACHE:
+            cached_text = PROMPT_CACHE[cache_key].get("text", "")
+            if cached_text:
+                print("[QwenVL PromptEnhancer GGUF] Streaming requested — bypassing prompt cache for a fresh streamed run")
+
         is_custom_only = preset_system_prompt == CUSTOM_ONLY_STYLE
         style_entry = {} if is_custom_only else self.styles.get(preset_system_prompt, {})
         style_system_prompt = (style_entry.get("system_prompt") or "").strip()
@@ -542,8 +981,22 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             raise ValueError("system_prompt is empty; check AILab_System_Prompts.json or preset selection.")
         system_prompt = f"{system_prompt}\n\n{prompt_output_guard()}"
         merged_prompt = prompt_text.strip() or "Describe a scene vividly."
-        self._load_model(model_name, device)
-        enhanced = self._invoke_llama(
+        model_cfg = self.gguf_models["models"].get(model_name, {})
+        context_window = model_cfg.get("context_length", 32768)
+        estimated_prompt_tokens = estimate_qwen_text_tokens(system_prompt, merged_prompt)
+        effective_thinking = resolve_qwen_thinking_mode(
+            enable_thinking,
+            max_tokens,
+            label="QwenVL PromptEnhancer GGUF",
+            prompt_tokens=estimated_prompt_tokens,
+            context_window=context_window,
+        )
+        if stream_tokens_to_terminal:
+            print("[QwenVL GGUF] Prompt enhancer terminal stream shows readable progress only; reasoning text may be hidden or stripped from the final prompt.")
+        else:
+            print("[QwenVL GGUF] Prompt enhancer compact terminal progress is active; enable stream_tokens_to_terminal for full readable chunk output.")
+        self._load_model(model_name, device, enable_thinking=effective_thinking)
+        enhanced, raw_trace = self._invoke_llama(
             system_prompt=system_prompt,
             user_prompt=merged_prompt,
             max_tokens=max_tokens,
@@ -551,9 +1004,18 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             top_p=top_p,
             repetition_penalty=repetition_penalty,
             seed=seed,
+            stream_to_terminal=stream_tokens_to_terminal,
+            initial_stage_label="INITIAL GENERATION",
+            enable_thinking=effective_thinking,
         )
+        if stream_tokens_to_terminal:
+            print(
+                f"[QwenVL GGUF] Thinking status: "
+                f"{_describe_prompt_enhancer_thinking(bool(enable_thinking), effective_thinking, raw_trace, retried='[FINALIZATION ATTEMPT ' in raw_trace)}"
+            )
+        full_raw_trace = raw_trace
         if english_output:
-            translated = self._invoke_llama(
+            translated, trans_trace = self._invoke_llama(
                 system_prompt=(
                     PROMPT_CONFIG.get("translation_prompt")
                     or "Return a single English paragraph (150-300 words). No prefixes, bullets, JSON, or </think>. "
@@ -565,35 +1027,39 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
                 top_p=0.95,
                 repetition_penalty=1.05,
                 seed=seed + 1,
+                stream_to_terminal=stream_tokens_to_terminal,
+                initial_stage_label="TRANSLATION STAGE",
+                enable_thinking=effective_thinking,
             )
+            full_raw_trace = f"{raw_trace}\n\n{trans_trace}"
             final = clean_model_output(translated, OutputCleanConfig(mode="prompt")) or translated.strip()
         else:
             final = clean_model_output(enhanced, OutputCleanConfig(mode="prompt")) or enhanced.strip()
-        
+
         # Cache the generated text
         PROMPT_CACHE[cache_key] = {
             "text": final,
-            "timestamp": None,  # GGUF PromptEnhancer doesn't have CUDA events
+            "timestamp": None,
             "model": model_name,
             "preset": preset_system_prompt,
             "seed": seed,
-            "image_hash": None,  # PromptEnhancer doesn't use images
-            "video_hash": None   # PromptEnhancer doesn't use videos
+            "image_hash": None,
+            "video_hash": None
         }
-        save_prompt_cache()  # Save cache to file
-        
+        save_prompt_cache()
+
         print(f"[QwenVL PromptEnhancer GGUF] Cached new prompt for seed {seed}: {cache_key[:8]}...")
-        
+
         try:
-            # Save the generated prompt for future bypass mode
-            LAST_SAVED_PROMPT = final
-            print(f"[QwenVL PromptEnhancer GGUF] Saved prompt for bypass mode: {final[:50]}...")
-            
-            return (final,)
+            # Persist per-node for future keep_last_prompt=True
+            set_node_saved_prompt(node_class, unique_id, extra_pnginfo, final, raw_trace=full_raw_trace, seed=seed, max_tokens=max_tokens, temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty, input_signature=input_signature)
+            print(f"[QwenVL PromptEnhancer GGUF] Saved per-node prompt: {final[:50]}...")
+
+            return (final, full_raw_trace)
         finally:
             if not keep_model_loaded:
                 self.clear()
-                print(f"[QwenVL PromptEnhancer GGUF] keep_model_loaded=False - cleaning up model...")
+                print(f"[QwenVL PromptEnhancer GGUF] keep_model_loaded=False — cleaning up model...")
 
     @staticmethod
     def _is_english(text):
