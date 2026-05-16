@@ -26,6 +26,8 @@ import torch
 from PIL import Image
 from huggingface_hub import snapshot_download
 from transformers import AutoProcessor, AutoTokenizer, BitsAndBytesConfig
+from AILab_StreamDisplay import TerminalStreamDisplay
+from comfy.model_management import throw_exception_if_processing_interrupted
 
 # SageAttention support
 try:
@@ -42,8 +44,135 @@ except ImportError:
 PROMPT_CACHE = {}
 CACHE_FILE = Path(__file__).parent / "prompt_cache.json"
 
-# Simple global variable to store last generated prompt
+# Simple global variable to store last generated prompt (DEPRECATED: prefer per-node state)
 LAST_SAVED_PROMPT = None
+
+# Per-node prompt state: survives idle, module reload, ComfyUI restart.
+# Keyed by node identity (workflow fingerprint + unique_id + node class).
+NODE_PROMPT_STATE = {}
+NODE_STATE_FILE = Path(__file__).parent / "node_prompt_state.json"
+QWEN_MIN_REASONING_BUDGET_TOKENS = 1024
+QWEN_FINAL_ANSWER_RESERVE_TOKENS = 256
+QWEN_CONTEXT_OVERHEAD_TOKENS = 128
+_QWEN_SOFT_SWITCHES = {"/think", "/no_think", "/nothink"}
+
+def _build_workflow_fingerprint(extra_pnginfo):
+    """Return a short stable fingerprint for a workflow dict so node state
+    can be scoped to a particular workflow window, avoiding cross-workflow
+    leakage while remaining stable across save/reload cycles."""
+    if not isinstance(extra_pnginfo, dict):
+        return None
+    workflow = extra_pnginfo.get("workflow")
+    if not isinstance(workflow, dict):
+        return None
+    try:
+        last_id = workflow.get("last_node_id", 0)
+        node_ids = sorted(
+            str(n.get("id", "")) for n in workflow.get("nodes", []) if isinstance(n, dict)
+        )
+        seed = f"{last_id}|{','.join(node_ids[:50])}"
+        return hashlib.md5(seed.encode()).hexdigest()[:12]
+    except Exception:
+        return None
+
+def _make_node_state_key(node_class, unique_id, extra_pnginfo):
+    """Produce a stable per-node key from the node class name, its numeric
+    identity within the workflow, and the workflow fingerprint when available."""
+    wf_fp = _build_workflow_fingerprint(extra_pnginfo)
+    if wf_fp:
+        return f"{node_class}|{wf_fp}|{unique_id}"
+    return f"{node_class}|{unique_id}"
+
+
+def _normalize_state_signature_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_normalize_state_signature_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_state_signature_value(val)
+            for key, val in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    return str(value)
+
+
+def build_node_input_signature(**kwargs):
+    """Return a stable hash for the node inputs that should invalidate saved prompt reuse."""
+    normalized = {
+        str(key): _normalize_state_signature_value(value)
+        for key, value in sorted(kwargs.items(), key=lambda item: str(item[0]))
+    }
+    payload = json.dumps(normalized, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+def load_node_prompt_state():
+    """Load per-node prompt state from the sidecar JSON file."""
+    global NODE_PROMPT_STATE
+    try:
+        if NODE_STATE_FILE.exists():
+            with open(NODE_STATE_FILE, "r", encoding="utf-8") as f:
+                NODE_PROMPT_STATE = json.load(f)
+                print(f"[QwenVL] Loaded {len(NODE_PROMPT_STATE)} node prompt states")
+    except Exception as e:
+        print(f"[QwenVL] Failed to load node prompt state: {e}")
+        NODE_PROMPT_STATE = {}
+
+def save_node_prompt_state():
+    """Persist per-node prompt state to the sidecar JSON file."""
+    try:
+        with open(NODE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(NODE_PROMPT_STATE, f, indent=2)
+    except Exception as e:
+        print(f"[QwenVL] Failed to save node prompt state: {e}")
+
+def get_node_saved_prompt(node_class, unique_id, extra_pnginfo):
+    """Return the saved prompt text for a specific node, or None."""
+    key = _make_node_state_key(node_class, unique_id, extra_pnginfo)
+    entry = NODE_PROMPT_STATE.get(key)
+    if isinstance(entry, dict) and entry.get("text"):
+        return entry["text"]
+    return None
+
+
+def get_node_saved_prompt_with_seed(node_class, unique_id, extra_pnginfo, seed=None, max_tokens=None, temperature=None, top_p=None, repetition_penalty=None, input_signature=None):
+    """Return saved prompt text only if the generation parameters haven't changed."""
+    key = _make_node_state_key(node_class, unique_id, extra_pnginfo)
+    entry = NODE_PROMPT_STATE.get(key)
+    if not isinstance(entry, dict) or not entry.get("text"):
+        return None
+    # If seed or params changed, invalidate and return None
+    if seed is not None and entry.get("seed") != seed:
+        return None
+    if max_tokens is not None and entry.get("max_tokens") != max_tokens:
+        return None
+    if temperature is not None and entry.get("temperature") != temperature:
+        return None
+    if top_p is not None and entry.get("top_p") != top_p:
+        return None
+    if repetition_penalty is not None and entry.get("repetition_penalty") != repetition_penalty:
+        return None
+    if input_signature is not None and entry.get("input_signature") != input_signature:
+        return None
+    return entry["text"]
+
+def set_node_saved_prompt(node_class, unique_id, extra_pnginfo, text, raw_trace=None, seed=None, max_tokens=None, temperature=None, top_p=None, repetition_penalty=None, input_signature=None):
+    """Persist the generated prompt (and optional raw trace) for a specific node."""
+    key = _make_node_state_key(node_class, unique_id, extra_pnginfo)
+    NODE_PROMPT_STATE[key] = {
+        "text": text,
+        "raw_trace": raw_trace or "",
+        "timestamp": None,
+        "seed": seed,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "repetition_penalty": repetition_penalty,
+        "input_signature": input_signature,
+    }
+    save_node_prompt_state()
 
 def load_prompt_cache():
     """Load prompt cache from file"""
@@ -65,15 +194,106 @@ def save_prompt_cache():
     except Exception as e:
         print(f"[QwenVL] Failed to save prompt cache: {e}")
 
-def get_cache_key(model_name, preset_prompt, custom_prompt, image_hash=None, video_hash=None, seed=None):
-    """Generate cache key from inputs"""
+
+def estimate_qwen_text_tokens(*parts):
+    """Conservatively estimate prompt tokens when an exact tokenizer is unavailable."""
+    total_chars = 0
+    non_empty_parts = 0
+    for part in parts:
+        if not part:
+            continue
+        normalized = " ".join(str(part).split())
+        if not normalized:
+            continue
+        total_chars += len(normalized)
+        non_empty_parts += 1
+    if total_chars <= 0:
+        return 0
+    return max(1, (total_chars + 3) // 4 + max(0, non_empty_parts - 1))
+
+
+def resolve_qwen_context_window(config, fallback=32768):
+    """Return the best available HF context window from the model config."""
+    candidates = []
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is None:
+            continue
+        for attr in ("max_position_embeddings", "n_positions", "seq_length"):
+            value = getattr(cfg, attr, None)
+            if isinstance(value, int) and 0 < value <= 2_000_000:
+                candidates.append(value)
+    if candidates:
+        return max(candidates)
+    return int(fallback)
+
+
+def resolve_qwen_thinking_mode(
+    requested_enable,
+    max_tokens,
+    label="QwenVL",
+    *,
+    prompt_tokens=None,
+    context_window=None,
+    min_reasoning_tokens=QWEN_MIN_REASONING_BUDGET_TOKENS,
+    answer_reserve_tokens=QWEN_FINAL_ANSWER_RESERVE_TOKENS,
+    context_overhead_tokens=QWEN_CONTEXT_OVERHEAD_TOKENS,
+):
+    """Enable thinking only when requested and enough generation budget remains."""
+    if not bool(requested_enable):
+        return False
+    requested_output = max(0, int(max_tokens or 0))
+    available_output = requested_output
+    prompt_token_count = max(0, int(prompt_tokens or 0))
+    context_limit = int(context_window) if context_window is not None else None
+
+    if context_limit is not None:
+        remaining_context = max(0, context_limit - prompt_token_count - int(context_overhead_tokens))
+        available_output = min(available_output, remaining_context) if available_output else remaining_context
+
+    minimum_required = int(min_reasoning_tokens) + int(answer_reserve_tokens)
+    if available_output <= 0 or available_output < minimum_required:
+        if context_limit is not None:
+            budget_note = (
+                f"max_tokens={requested_output}, prompt_tokens={prompt_token_count}, "
+                f"context_window={context_limit}, available_output={available_output}"
+            )
+        else:
+            budget_note = f"max_tokens={requested_output}, available_output={available_output}"
+        print(
+            f"[{label}] Thinking requested but {budget_note} is below the required {minimum_required} tokens "
+            f"({int(min_reasoning_tokens)} reasoning + {int(answer_reserve_tokens)} answer reserve); "
+            "forcing non-thinking mode to preserve answer space."
+        )
+        return False
+    return True
+
+
+def apply_qwen_soft_thinking_directive(prompt_text, enable_thinking, supports_soft_switch=False):
+    """Append the latest Qwen3 soft switch when the backend supports it."""
+    text = prompt_text or ""
+    if not supports_soft_switch:
+        return text
+    lines = [line for line in text.splitlines() if line.strip().lower() not in _QWEN_SOFT_SWITCHES]
+    lines.append("/think" if enable_thinking else "/no_think")
+    return "\n".join(lines).strip()
+
+def get_cache_key(model_name, preset_prompt, custom_prompt, image_hash=None, video_hash=None, seed=None, max_tokens=None, temperature=None, top_p=None, repetition_penalty=None):
+    """Generate cache key from inputs including all generation parameters.
+
+    All generation-parameter fields are optional so existing callers that omit them
+    continue to work; when provided, changing any parameter produces a different key.
+    """
     key_data = {
         "model": model_name,
         "preset": preset_prompt,
         "custom": custom_prompt.strip() if custom_prompt else "",
         "image": image_hash,
         "video": video_hash,
-        "seed": seed  # Always include seed to ensure proper caching behavior
+        "seed": seed,  # Always include seed to ensure proper caching behavior
+        "max_tokens": max_tokens,
+        "temperature": temperature if temperature is not None else None,
+        "top_p": top_p if top_p is not None else None,
+        "repetition_penalty": repetition_penalty if repetition_penalty is not None else None,
     }
     # Create deterministic hash
     key_str = json.dumps(key_data, sort_keys=True)
@@ -215,15 +435,33 @@ def get_video_hash(video):
     """Generate hash for video tensor (same as image)"""
     return get_image_hash(video)
 
-# Load cache on module import
+# Load cache and per-node state on module import
 load_prompt_cache()
+load_node_prompt_state()
 try:
     from transformers import AutoModelForVision2Seq
 except ImportError:
     from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
 # Export memory functions for external use
-__all__ = ['PROMPT_CACHE', 'get_cache_key', 'get_alternative_cache_key', 'save_prompt_cache', 'get_image_hash', 'get_video_hash', 'check_pytorch_memory', 'set_pytorch_memory_fraction', 'get_device_info', 'tensor_to_pil', 'get_video_hash', 'enforce_memory', 'quantization_config', 'ensure_model', 'resolve_attention_mode', 'flash_attn_available', 'normalize_device_choice', 'load_model_configs', 'HF_VL_MODELS', 'HF_TEXT_MODELS', 'HF_ALL_MODELS', 'SYSTEM_PROMPTS', 'PRESET_PROMPTS', 'TOOLTIPS', 'Quantization', 'ATTENTION_MODES', 'NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+__all__ = [
+    'PROMPT_CACHE', 'NODE_PROMPT_STATE',
+    'get_cache_key', 'get_alternative_cache_key',
+    'save_prompt_cache',
+    'get_image_hash', 'get_video_hash',
+    'check_pytorch_memory', 'set_pytorch_memory_fraction',
+    'get_device_info', 'tensor_to_pil', 'enforce_memory',
+    'quantization_config', 'ensure_model', 'resolve_attention_mode',
+    'flash_attn_available', 'normalize_device_choice',
+    'load_model_configs',
+    'HF_VL_MODELS', 'HF_TEXT_MODELS', 'HF_ALL_MODELS',
+    'SYSTEM_PROMPTS', 'PRESET_PROMPTS', 'TOOLTIPS',
+    'Quantization', 'ATTENTION_MODES',
+    'NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS',
+    'get_node_saved_prompt_with_seed', 'get_node_saved_prompt', 'set_node_saved_prompt',
+    'load_node_prompt_state', 'save_node_prompt_state',
+    '_make_node_state_key',
+]
 
 import folder_paths
 
@@ -234,7 +472,8 @@ HF_VL_MODELS: dict[str, dict] = {}
 HF_TEXT_MODELS: dict[str, dict] = {}
 HF_ALL_MODELS: dict[str, dict] = {}
 SYSTEM_PROMPTS = {}
-PRESET_PROMPTS: list[str] = ["Describe this image in detail."]
+NO_PRESET_PROMPT = "🚫 No preset (image-only)"
+PRESET_PROMPTS: list[str] = [NO_PRESET_PROMPT, "Describe this image in detail."]
 
 TOOLTIPS = {
     "model_name": "Pick the Qwen-VL checkpoint. First run downloads weights into models/LLM/Qwen-VL, so leave disk space.",
@@ -316,6 +555,11 @@ def load_model_configs():
         pass
     except Exception as exc:
         print(f"[QwenVL] System prompts load failed: {exc}")
+
+    if NO_PRESET_PROMPT not in PRESET_PROMPTS:
+        PRESET_PROMPTS = [NO_PRESET_PROMPT, *PRESET_PROMPTS]
+    if isinstance(SYSTEM_PROMPTS, dict):
+        SYSTEM_PROMPTS.setdefault(NO_PRESET_PROMPT, "")
     custom = NODE_DIR / "custom_models.json"
     if custom.exists():
         try:
@@ -895,7 +1139,9 @@ class QwenVLBase:
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         # Detect architecture from config.json instead of relying on model name
         hf_model_type = read_hf_model_type(model_path)
+        self.hf_model_type = hf_model_type
         self.is_qwen35 = hf_model_type in ("qwen3_5", "qwen3_5_moe", "qwen3_5_vl") if hf_model_type else "qwen3.5-" in model_name.lower()
+        self.supports_qwen_soft_think = hf_model_type == "qwen3" if hf_model_type else "qwen3-" in model_name.lower()
         if self.is_qwen35:
             print(f"[QwenVL] Qwen3.5 detected (model_type={hf_model_type}): Will disable thinking in chat template.")
         self.current_signature = signature
@@ -928,45 +1174,68 @@ class QwenVLBase:
         num_beams,
         repetition_penalty,
         model_name="",
+        stream_to_terminal=False,
+        enable_thinking=True,
     ):
         # Memory optimization: clear cache before generation
         ensure_cuda_vram_headroom("QwenVL", min_free_gb=1.0, min_free_ratio=0.08)
-        
-        conversation = [{"role": "user", "content": []}]
-        if image is not None:
-            if image.dim() == 4 and image.shape[0] > 1:
-                print(f"[QwenVL] IMAGE input contains {image.shape[0]} items; using the first item only. Use the video input for multi-frame analysis.")
-            conversation[0]["content"].append({"type": "image", "image": self.tensor_to_pil(image)})
-        if video is not None:
-            frames = [self.tensor_to_pil(frame) for frame in video]
-            if len(frames) > frame_count:
-                idx = np.linspace(0, len(frames) - 1, frame_count, dtype=int)
-                frames = [frames[i] for i in idx]
-            if frames:
-                conversation[0]["content"].append({"type": "video", "video": frames})
-        conversation[0]["content"].append({"type": "text", "text": prompt_text})
-        
-        # --- Qwen3.5 Heretic Logic: Template ---
+        supports_soft_think = getattr(self, "supports_qwen_soft_think", False)
         is_qwen35 = getattr(self, "is_qwen35", False)
-        chat_kwargs = {}
-        if is_qwen35:
-            chat_kwargs["enable_thinking"] = False
+        context_window = resolve_qwen_context_window(getattr(self.model, "config", None))
 
-        # Optimize chat template for memory efficiency
-        chat = self.processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=True,
-            **chat_kwargs
+        def _build_processed(thinking_enabled: bool):
+            effective_prompt_text = apply_qwen_soft_thinking_directive(
+                prompt_text,
+                thinking_enabled,
+                supports_soft_switch=supports_soft_think,
+            )
+            conversation = [{"role": "user", "content": []}]
+            if image is not None:
+                if image.dim() == 4 and image.shape[0] > 1:
+                    print(f"[QwenVL] IMAGE input contains {image.shape[0]} items; using the first item only. Use the video input for multi-frame analysis.")
+                conversation[0]["content"].append({"type": "image", "image": self.tensor_to_pil(image)})
+            if video is not None:
+                frames = [self.tensor_to_pil(frame) for frame in video]
+                if len(frames) > frame_count:
+                    idx = np.linspace(0, len(frames) - 1, frame_count, dtype=int)
+                    frames = [frames[i] for i in idx]
+                if frames:
+                    conversation[0]["content"].append({"type": "video", "video": frames})
+            conversation[0]["content"].append({"type": "text", "text": effective_prompt_text})
+
+            chat_kwargs = {}
+            if is_qwen35 or supports_soft_think:
+                chat_kwargs["enable_thinking"] = thinking_enabled
+
+            chat = self.processor.apply_chat_template(
+                conversation,
+                tokenize=False,
+                add_generation_prompt=True,
+                **chat_kwargs
+            )
+
+            images = [item["image"] for item in conversation[0]["content"] if item["type"] == "image"]
+            video_frames = [frame for item in conversation[0]["content"] if item["type"] == "video" for frame in item["video"]]
+            videos = [video_frames] if video_frames else None
+            processed = self.processor(text=chat, images=images or None, videos=videos, return_tensors="pt")
+            return effective_prompt_text, processed
+
+        requested_thinking = bool(enable_thinking)
+        _, processed = _build_processed(requested_thinking)
+        input_ids = processed.get("input_ids")
+        prompt_tokens = int(input_ids.shape[-1]) if torch.is_tensor(input_ids) else 0
+        effective_thinking = resolve_qwen_thinking_mode(
+            enable_thinking,
+            max_tokens,
+            label="QwenVL HF",
+            prompt_tokens=prompt_tokens,
+            context_window=context_window,
         )
-        
-        # Process images/videos more efficiently
-        images = [item["image"] for item in conversation[0]["content"] if item["type"] == "image"]
-        video_frames = [frame for item in conversation[0]["content"] if item["type"] == "video" for frame in item["video"]]
-        videos = [video_frames] if video_frames else None
-        
-        # Use smaller batch size for memory efficiency
-        processed = self.processor(text=chat, images=images or None, videos=videos, return_tensors="pt")
+        if effective_thinking != requested_thinking:
+            _, processed = _build_processed(effective_thinking)
+        if supports_soft_think:
+            directive = "/think" if effective_thinking else "/no_think"
+            print(f"[QwenVL] Qwen3 detected: Thinking {'enabled' if effective_thinking else 'disabled'} via chat template and {directive}.")
         
         # Move to device more efficiently
         model_device = next(self.model.parameters()).device
@@ -995,62 +1264,109 @@ class QwenVLBase:
         else:
             kwargs["do_sample"] = False
             
-        # Generate with memory monitoring
-        try:
-            outputs = self.model.generate(**model_inputs, **kwargs)
-        except torch.cuda.OutOfMemoryError as e:
-            # Clear memory and retry with reduced parameters
-            print(f"[QwenVL] OOM detected, clearing memory and retrying...")
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # Retry with smaller max_tokens
-            reduced_tokens = max(256, max_tokens // 2)
-            kwargs["max_new_tokens"] = reduced_tokens
-            print(f"[QwenVL] Retrying with reduced tokens: {reduced_tokens}")
-            
+        # Optional: terminal streaming with rolling 200-char window
+        if stream_to_terminal:
             try:
-                outputs = self.model.generate(**model_inputs, **kwargs)
-            except torch.cuda.OutOfMemoryError:
-                print(f"[QwenVL] OOM still occurs with {reduced_tokens} tokens, falling back to CPU")
-                # Fallback to CPU if GPU still OOM
-                device_backup = model_inputs["input_ids"].device
-                for key in model_inputs:
-                    if torch.is_tensor(model_inputs[key]):
-                        model_inputs[key] = model_inputs[key].cpu()
-                outputs = self.model.generate(**model_inputs, **kwargs)
+                from transformers import TextIteratorStreamer
+                from threading import Thread
+                sd = TerminalStreamDisplay("QwenVL HF", compact=True)
+                streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+                kwargs["streamer"] = streamer
+                thread = Thread(target=self.model.generate, kwargs={**model_inputs, **kwargs})
+                thread.start()
+                full_streamed = ""
+                for token_str in streamer:
+                    if token_str:
+                        throw_exception_if_processing_interrupted()
+                        full_streamed += token_str
+                        sd.push_compact(token_str)
+                thread.join()
+                sd.end_compact()
+                if not full_streamed.strip():
+                    raise RuntimeError("[QwenVL] HF streaming returned empty response")
+                return full_streamed.strip(), full_streamed.strip()
+            except ImportError:
+                print("[QwenVL] TextIteratorStreamer not available — falling back to non-streaming")
+                stream_to_terminal = False
+
+        # Generate with interrupt support via background thread
+        import threading, queue as qmod
+        abort_event = threading.Event()
+        output_queue: qmod.Queue = qmod.Queue()
+        worker_error: Exception | None = None
+
+        def _generate_worker():
+            nonlocal worker_error
+            try:
+                result = self.model.generate(**model_inputs, **kwargs)
+                output_queue.put(("ok", result))
+            except Exception as exc:
+                worker_error = exc
+                output_queue.put(("error", None))
+
+        worker = threading.Thread(target=_generate_worker, daemon=True)
+        worker.start()
+        try:
+            while True:
+                try:
+                    kind, result = output_queue.get(timeout=0.25)
+                except qmod.Empty:
+                    throw_exception_if_processing_interrupted()
+                    continue
+                if kind == "error":
+                    break
+                outputs = result
+                break
+        finally:
+            abort_event.set()
+            worker.join(timeout=5.0)
+        if worker_error:
+            raise worker_error
+        throw_exception_if_processing_interrupted()
         
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         input_len = model_inputs["input_ids"].shape[-1]
-        text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
-        return text.strip()
+        raw_text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True).strip()
+        cleaned_text = raw_text  # generate() returns raw; caller cleans if needed
+        return cleaned_text, raw_text
 
-    def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, keep_last_prompt=False):
+    def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, keep_last_prompt=False, unique_id=None, extra_pnginfo=None, node_class="QwenVL", stream_to_terminal=False, enable_thinking=True):
         torch.manual_seed(seed)
-        
-        global LAST_SAVED_PROMPT
-        
-        # Simple keep last prompt logic
-        if keep_last_prompt:
-            print(f"[QwenVL] Keep last prompt enabled - using last saved prompt")
-            if LAST_SAVED_PROMPT:
-                print(f"[QwenVL] Using last prompt: {LAST_SAVED_PROMPT[:50]}...")
-                return (LAST_SAVED_PROMPT,)
-            else:
-                print(f"[QwenVL] No previous prompt found, returning empty")
-                return ("",)
-        
-        # Always generate when keep last prompt is disabled
-        print(f"[QwenVL] Keep last prompt disabled - generating new prompt")
-        
-        prompt_template = SYSTEM_PROMPTS.get(preset_prompt, preset_prompt)
-        
-        # Generate cache key with all inputs including seed
         image_hash = get_image_hash(image)
         video_hash = get_video_hash(video)
-        cache_key = get_cache_key(model_name, preset_prompt, custom_prompt, image_hash, video_hash, seed)
+        input_signature = build_node_input_signature(
+            model_name=model_name,
+            quantization=quantization,
+            preset_prompt=preset_prompt,
+            custom_prompt=custom_prompt,
+            image_hash=image_hash,
+            video_hash=video_hash,
+            frame_count=frame_count,
+            attention_mode=attention_mode,
+            use_torch_compile=bool(use_torch_compile),
+            device=device,
+            enable_thinking=bool(enable_thinking),
+        )
+        
+        # Auto-retrieve saved prompt when seed is fixed
+        saved = get_node_saved_prompt_with_seed(node_class, unique_id, extra_pnginfo, seed=seed, max_tokens=max_tokens, temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty, input_signature=input_signature)
+        if keep_last_prompt:
+            print(f"[QwenVL] Keep last prompt enabled — looking up per-node state")
+            if saved:
+                print(f"[QwenVL] Using per-node prompt: {saved[:50]}...")
+                return (saved,)
+            else:
+                print(f"[QwenVL] No per-node prompt found, returning empty")
+                return ("",)
+        
+        # Always generate unless keep_last_prompt was requested
+        print(f"[QwenVL] Generating new prompt")
+        
+        prompt_template = "" if preset_prompt == NO_PRESET_PROMPT else SYSTEM_PROMPTS.get(preset_prompt, preset_prompt)
+        
+        # Generate cache key with all inputs including seed
+        cache_key = get_cache_key(model_name, preset_prompt, custom_prompt, image_hash, video_hash, seed, max_tokens=max_tokens, temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty)
         
         # Check cache first (only for random mode)
         if cache_key in PROMPT_CACHE:
@@ -1061,7 +1377,7 @@ class QwenVLBase:
         
         if custom_prompt and custom_prompt.strip():
             # Combine user input with template - custom prompt first for priority
-            prompt = f"{custom_prompt.strip()}\n\n{prompt_template}"
+            prompt = f"{custom_prompt.strip()}\n\n{prompt_template}" if prompt_template else custom_prompt.strip()
         else:
             prompt = prompt_template
             
@@ -1074,7 +1390,7 @@ class QwenVLBase:
             keep_model_loaded,
         )
         try:
-            text = self.generate(
+            text, raw_text = self.generate(
                 prompt,
                 image,
                 video,
@@ -1085,6 +1401,8 @@ class QwenVLBase:
                 num_beams,
                 repetition_penalty,
                 model_name=model_name,
+                stream_to_terminal=stream_to_terminal,
+                enable_thinking=enable_thinking,
             )
             
             # Cache the generated text
@@ -1101,9 +1419,9 @@ class QwenVLBase:
             
             print(f"[QwenVL] Cached new prompt for seed {seed}: {cache_key[:8]}...")
             
-            # Save the generated prompt for future bypass mode
-            LAST_SAVED_PROMPT = text
-            print(f"[QwenVL] Saved prompt for bypass mode: {text[:50]}...")
+            # Save the generated prompt for future per-node keep-last-prompt
+            set_node_saved_prompt(node_class, unique_id, extra_pnginfo, text, raw_trace=raw_text, seed=seed, max_tokens=max_tokens, temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty, input_signature=input_signature)
+            print(f"[QwenVL] Saved per-node prompt: {text[:50]}...")
             
             return (text,)
         finally:
@@ -1115,42 +1433,53 @@ class AILab_QwenVL(QwenVLBase):
     def INPUT_TYPES(cls):
         models = list(HF_VL_MODELS.keys())
         default_model = models[0] if models else "Qwen3-VL-4B-Instruct"
-        prompts = PRESET_PROMPTS or ["Describe this image in detail."]
+        prompts = PRESET_PROMPTS or [NO_PRESET_PROMPT, "Describe this image in detail."]
         preferred_prompt = "🖼️ Detailed Description"
         default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
         return {
             "required": {
                 "model_name": (models, {"default": default_model, "tooltip": TOOLTIPS["model_name"]}),
                 "attention_mode": (ATTENTION_MODES, {"default": "auto", "tooltip": TOOLTIPS["attention_mode"]}),
-                "preset_prompt": (prompts, {"default": default_prompt, "tooltip": TOOLTIPS["preset_prompt"]}),
+            "preset_prompt": (prompts, {"default": default_prompt, "tooltip": TOOLTIPS["preset_prompt"] + "\n\nSelect 'No preset' to use only the custom prompt or image input."}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
                 "max_tokens": ("INT", {"default": 8192, "min": 64, "max": 8192, "tooltip": TOOLTIPS["max_tokens"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"] + "\n\n💡 Cache Info: Prompts are cached automatically. Use the same inputs (model, preset, custom prompt, image/video) to reuse cached prompts and avoid regeneration.\n\n🔒 Fixed Seed Mode: Set seed = 1 to ignore image/video changes and only use text-based caching. Perfect for keeping the same prompt regardless of media input variations."}),
                 "keep_last_prompt": ("BOOLEAN", {"default": False, "tooltip": "Keep the last generated prompt instead of creating a new one"}),
+                "stream_tokens_to_terminal": ("BOOLEAN", {"default": False, "tooltip": "Print every generated token live to the ComfyUI terminal/console"}),
+                "enable_thinking": ("BOOLEAN", {"default": True, "tooltip": "Enable model reasoning/thinking when the backend supports it: True=allow thinking, False=force direct answer. Even when enabled, easy prompts may still get a direct answer, and this node automatically disables thinking when there is not enough output budget left for useful reasoning. For non-Qwen models (Gemma, LLaMA) this is advisory."}),
             },
             "optional": {
                 "image": ("IMAGE",),
                 "video": ("IMAGE",),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("RESPONSE",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("RESPONSE", "RAW_TRACE")
     FUNCTION = "process"
     CATEGORY = "Qwen3.5-Uncensored"
 
-    def process(self, model_name, preset_prompt, custom_prompt, attention_mode, max_tokens, keep_model_loaded, seed, keep_last_prompt=False, image=None, video=None):
+    def process(self, model_name, preset_prompt, custom_prompt, attention_mode, max_tokens, keep_model_loaded, seed, keep_last_prompt=False, image=None, video=None, unique_id=None, extra_pnginfo=None, stream_tokens_to_terminal=False, enable_thinking=True):
         # Always use FP16 - dropdown removed but keep working logic
         quantization = Quantization.FP16.value
-        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, 16, max_tokens, 0.6, 0.9, 1, 1.2, seed, keep_model_loaded, attention_mode, False, "auto", keep_last_prompt)
+        result = self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, 16, max_tokens, 0.6, 0.9, 1, 1.2, seed, keep_model_loaded, attention_mode, False, "auto", keep_last_prompt, unique_id=unique_id, extra_pnginfo=extra_pnginfo, node_class="AILab_QwenVL", stream_to_terminal=stream_tokens_to_terminal, enable_thinking=enable_thinking)
+        # Retrieve the raw_trace that was saved alongside the cleaned prompt in run()
+        key = _make_node_state_key("AILab_QwenVL", unique_id, extra_pnginfo)
+        entry = NODE_PROMPT_STATE.get(key, {})
+        raw_trace = entry.get("raw_trace", "") if isinstance(entry, dict) else ""
+        return (result[0], raw_trace)
 
 class AILab_QwenVL_Advanced(QwenVLBase):
     @classmethod
     def INPUT_TYPES(cls):
         models = list(HF_VL_MODELS.keys())
         default_model = models[0] if models else "Qwen3-VL-4B-Instruct"
-        prompts = PRESET_PROMPTS or ["Describe this image in detail."]
+        prompts = PRESET_PROMPTS or [NO_PRESET_PROMPT, "Describe this image in detail."]
         preferred_prompt = "🖼️ Detailed Description"
         default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
 
@@ -1164,7 +1493,7 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "attention_mode": (ATTENTION_MODES, {"default": "auto", "tooltip": TOOLTIPS["attention_mode"]}),
                 "use_torch_compile": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["use_torch_compile"]}),
                 "device": (device_options, {"default": "auto", "tooltip": TOOLTIPS["device"]}),
-                "preset_prompt": (prompts, {"default": default_prompt, "tooltip": TOOLTIPS["preset_prompt"]}),
+                "preset_prompt": (prompts, {"default": default_prompt, "tooltip": TOOLTIPS["preset_prompt"] + "\n\nSelect 'No preset' to use only the custom prompt or image input."}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
                 "max_tokens": ("INT", {"default": 8192, "min": 64, "max": 8192, "tooltip": TOOLTIPS["max_tokens"]}),
                 "temperature": ("FLOAT", {"default": 0.6, "min": 0.1, "max": 1.0, "tooltip": TOOLTIPS["temperature"]}),
@@ -1175,22 +1504,33 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"] + "\n\n💡 Cache Info: Prompts are cached automatically. Use same inputs (model, preset, custom prompt, image/video) to reuse cached prompts and avoid regeneration.\n\n🔒 Fixed Seed Mode: Set seed = 1 to ignore image/video changes and only use text-based caching. Perfect for keeping the same prompt regardless of media input variations."}),
                 "keep_last_prompt": ("BOOLEAN", {"default": False, "tooltip": "Keep last generated prompt instead of creating a new one"}),
+                "stream_tokens_to_terminal": ("BOOLEAN", {"default": False, "tooltip": "Print every generated token live to the ComfyUI terminal/console"}),
+                "enable_thinking": ("BOOLEAN", {"default": True, "tooltip": "Enable model reasoning/thinking when the backend supports it: True=allow thinking, False=force direct answer. Even when enabled, easy prompts may still get a direct answer, and this node automatically disables thinking when there is not enough output budget left for useful reasoning. For non-Qwen models (Gemma, LLaMA) this is advisory."}),
             },
             "optional": {
                 "image": ("IMAGE",),
                 "video": ("IMAGE",),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("RESPONSE",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("RESPONSE", "RAW_TRACE")
     FUNCTION = "process"
     CATEGORY = "Qwen3.5-Uncensored"
 
-    def process(self, model_name, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, keep_model_loaded, seed, keep_last_prompt, image=None, video=None):
+    def process(self, model_name, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, keep_model_loaded, seed, keep_last_prompt, image=None, video=None, unique_id=None, extra_pnginfo=None, stream_tokens_to_terminal=False, enable_thinking=True):
         # Always use FP16 - dropdown removed but keep working logic
         quantization = Quantization.FP16.value
-        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, keep_last_prompt)
+        result = self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, keep_last_prompt, unique_id=unique_id, extra_pnginfo=extra_pnginfo, node_class="AILab_QwenVL_Advanced", stream_to_terminal=stream_tokens_to_terminal, enable_thinking=enable_thinking)
+        # Read back raw_trace from just-saved per-node state
+        key = _make_node_state_key("AILab_QwenVL_Advanced", unique_id, extra_pnginfo)
+        entry = NODE_PROMPT_STATE.get(key, {})
+        raw_trace = entry.get("raw_trace", "") if isinstance(entry, dict) else ""
+        return (result[0], raw_trace)
 
 NODE_CLASS_MAPPINGS = {
     "AILab_QwenVL": AILab_QwenVL,
