@@ -124,59 +124,59 @@
 This update resolves critical issues with I2V Timeline preset generation and optimizes all NSFW presets for better user experience.
 
 ### 🚨 **Major I2V Timeline Fixes**
-|- **Style Coherence**: Fixed AI changing anime→realism mid-sequence
-|- **Character Stability**: Fixed characters disappearing/appearing incorrectly  
-|- **Natural Lighting**: Fixed AI adding artificial lights not in image  
-|- **Timeline Structure**: Fixed continuous numbering (6,7,8...) instead of 0-5 restart  
-|- **Format Consistency**: Fixed missing parentheses and unwanted labels  
-|- **Output Format**: Each prompt starts directly with timeline markers
+- **Style Coherence**: Fixed AI changing anime→realism mid-sequence
+- **Character Stability**: Fixed characters disappearing/appearing incorrectly  
+- **Natural Lighting**: Fixed AI adding artificial lights not in image  
+- **Timeline Structure**: Fixed continuous numbering (6,7,8...) instead of 0-5 restart  
+- **Format Consistency**: Fixed missing parentheses and unwanted labels  
+- **Output Format**: Each prompt starts directly with timeline markers
 
 ### � **NSFW Presets Optimization**
-|- **Complete Specifications**: All 8 NSFW presets now include full NSFW descriptions
-|- **Emoji Display**: Restored proper emoji rendering (🍿🎥🎬📖🍿🎥🎬📖)
-|- **Clear Instructions**: Removed confusing recommendations from presets
-|- **User Notes**: Token settings guide created for workflow optimization
+- **Complete Specifications**: All 8 NSFW presets now include full NSFW descriptions
+- **Emoji Display**: Restored proper emoji rendering (🍿🎥🎬📖🍿🎥🎬📖)
+- **Clear Instructions**: Removed confusing recommendations from presets
+- **User Notes**: Token settings guide created for workflow optimization
 
 ### 📋 **Technical Improvements**
-|- **Timeline Markers**: Correct `(At X seconds: ...)` format for all 4 prompts
-|- **Character Continuity**: Natural progression without forced artificial presence
-|- **Lighting Rules**: Logical progression instead of absolute prohibitions
-|- **Style Detection**: Consistent style application across all timeline segments
+- **Timeline Markers**: Correct `(At X seconds: ...)` format for all 4 prompts
+- **Character Continuity**: Natural progression without forced artificial presence
+- **Lighting Rules**: Logical progression instead of absolute prohibitions
+- **Style Detection**: Consistent style application across all timeline segments
 
 ### 🎯 **Model Recommendations**
-|- **Qwen3-VL-8B**: Recommended for I2V Timeline (20s) complex sequences
-|- **Qwen3-VL-4B**: Sufficient for I2V Scene (5s) single prompts
-|- **Token Settings**: 2048+ for 20s timeline, 1024+ for 5s prompts
+- **Qwen3-VL-8B**: Recommended for I2V Timeline (20s) complex sequences
+- **Qwen3-VL-4B**: Sufficient for I2V Scene (5s) single prompts
+- **Token Settings**: 2048+ for 20s timeline, 1024+ for 5s prompts
 
 ## Version 2.0.7 (2026/02/03)
-|- **FP16 Only**: All HF nodes now use FP16 exclusively (~6GB VRAM on RTX 5090)
-|- **Quantization Dropdown Removed**: Eliminated confusing quantization options from all HF nodes
-|- **Working Logic Restored**: Reverted to proven working FP16 logic from commit d057b34
-|- **Both Nodes Fixed**: Applied fixes to both Standard and Advanced nodes
+- **FP16 Only**: All HF nodes now use FP16 exclusively (~6GB VRAM on RTX 5090)
+- **Quantization Dropdown Removed**: Eliminated confusing quantization options from all HF nodes
+- **Working Logic Restored**: Reverted to proven working FP16 logic from commit d057b34
+- **Both Nodes Fixed**: Applied fixes to both Standard and Advanced nodes
 
 ### 🎯 **Interface Simplification**
-|- **Cleaner UI**: Removed quantization dropdown from QwenVL and QwenVL Advanced nodes
-|- **GGUF for Quantization**: Users wanting quantized models should use dedicated GGUF nodes
-|- **Consistent Parameters**: Both nodes now have consistent parameter structure
-|- **keep_last_prompt**: Added missing parameter to maintain feature parity
+- **Cleaner UI**: Removed quantization dropdown from QwenVL and QwenVL Advanced nodes
+- **GGUF for Quantization**: Users wanting quantized models should use dedicated GGUF nodes
+- **Consistent Parameters**: Both nodes now have consistent parameter structure
+- **keep_last_prompt**: Added missing parameter to maintain feature parity
 
 ### 🔧 **Technical Changes**
-|- **Memory Management**: Improved model loading with CPU→CUDA transfer pattern
-|- **Attention Backend**: SDPA as stable default (SageAttention can be added later)
-|- **Error Prevention**: Removed all BitsAndBytes-related code paths
-|- **Debug Logging**: Enhanced logging for attention mode selection and model loading
+- **Memory Management**: Improved model loading with CPU→CUDA transfer pattern
+- **Attention Backend**: SDPA as stable default (SageAttention can be added later)
+- **Error Prevention**: Removed all BitsAndBytes-related code paths
+- **Debug Logging**: Enhanced logging for attention mode selection and model loading
 
 ### 🐛 **Bug Fixes**
-|- **OOM on RTX 5090**: Fixed critical Out-Of-Memory during model loading
-|- **Missing Parameters**: Added frame_count and keep_last_prompt to Advanced node
-|- **Quantization Logic**: Simplified to prevent device mismatch and quantization errors
-|- **Function Signatures**: Corrected all process() functions after dropdown removal
+- **OOM on RTX 5090**: Fixed critical Out-Of-Memory during model loading
+- **Missing Parameters**: Added frame_count and keep_last_prompt to Advanced node
+- **Quantization Logic**: Simplified to prevent device mismatch and quantization errors
+- **Function Signatures**: Corrected all process() functions after dropdown removal
 
 ### 💡 **User Guidance**
-|- **HF Nodes**: Use for maximum quality with FP16 (~6GB VRAM)
-|- **GGUF Nodes**: Use for quantized models (Q4/Q8, 2-4GB VRAM)
-|- **Performance**: FP16 + SageAttention/FlashAttention for best speed
-|- **Stability**: SDPA fallback ensures compatibility across all hardware
+- **HF Nodes**: Use for maximum quality with FP16 (~6GB VRAM)
+- **GGUF Nodes**: Use for quantized models (Q4/Q8, 2-4GB VRAM)
+- **Performance**: FP16 + SageAttention/FlashAttention for best speed
+- **Stability**: SDPA fallback ensures compatibility across all hardware
 
 ---
 
@@ -187,11 +187,11 @@ This update resolves critical issues with I2V Timeline preset generation and opt
 This update removes redundant memory management features and improves CUDA 13 compatibility.
 
 ### 🔧 **Memory Management Cleanup**
-|- **Removed unload_after_run**: Eliminated redundant checkbox from all QwenVL nodes
-|- **Fixed Parameter Errors**: Resolved missing argument errors in GGUF and PromptEnhancer nodes
-|- **Conflict Prevention**: Prevents multiple unload operations that cause CUDA 13 crashes
-|- **Simplified Interface**: Cleaner node interface without redundant parameters
-|- **VRAM Cleanup Node**: Maintained for manual cleanup when needed
+- **Removed unload_after_run**: Eliminated redundant checkbox from all QwenVL nodes
+- **Fixed Parameter Errors**: Resolved missing argument errors in GGUF and PromptEnhancer nodes
+- **Conflict Prevention**: Prevents multiple unload operations that cause CUDA 13 crashes
+- **Simplified Interface**: Cleaner node interface without redundant parameters
+- **VRAM Cleanup Node**: Maintained for manual cleanup when needed
 
 ### 🐛 **Bug Fixes**
 - **VastAI CUDA 13**: Fixed crashes caused by conflicting unload operations
@@ -206,9 +206,9 @@ This update removes redundant memory management features and improves CUDA 13 co
 - **Troubleshooting**: Added CUDA 13 specific guidance
 
 ### 🏆 Credits & Attribution
-|- **Community Feedback**: Thanks to user testing that identified redundancy issue
-|- **CUDA 13 Testing**: Comprehensive testing on VastAI infrastructure
-|- **Memory Management**: Streamlined approach for better stability
+- **Community Feedback**: Thanks to user testing that identified redundancy issue
+- **CUDA 13 Testing**: Comprehensive testing on VastAI infrastructure
+- **Memory Management**: Streamlined approach for better stability
 
 ---
 
@@ -223,51 +223,51 @@ This update removes redundant memory management features and improves CUDA 13 co
 This major update resolves critical workflow issues with T2V/I2V batch processing, same model reuse conflicts, and adds significant performance optimizations including Flash Attention 2 support and refined ComfyUI startup arguments.
 
 ### 🚀 T2V/I2V Workflow Fixes (Critical)
-|- **Batch Processing**: Fixed critical T2V → GGUF issue with batch images `[batch, height, width, channels]`
-|- **Frame Detection**: Added automatic batch detection and individual frame processing
-|- **Video Support**: Enhanced video frame processing with proper shape handling
-|- **Debug Enhanced**: Comprehensive logging for batch processing troubleshooting
+- **Batch Processing**: Fixed critical T2V → GGUF issue with batch images `[batch, height, width, channels]`
+- **Frame Detection**: Added automatic batch detection and individual frame processing
+- **Video Support**: Enhanced video frame processing with proper shape handling
+- **Debug Enhanced**: Comprehensive logging for batch processing troubleshooting
 
 ### **Same Model Reuse Fix**
-|- **Conflict Resolution**: Fixed crash when using same model between T2V and I2V nodes
-|- **Memory Management**: Enhanced cleanup with CUDA synchronization and timing
-|- **Signature Mismatch**: Resolved different signature patterns between nodes
-|- **Aggressive Cleanup**: Forced complete VRAM cleanup before model reload
+- **Conflict Resolution**: Fixed crash when using same model between T2V and I2V nodes
+- **Memory Management**: Enhanced cleanup with CUDA synchronization and timing
+- **Signature Mismatch**: Resolved different signature patterns between nodes
+- **Aggressive Cleanup**: Forced complete VRAM cleanup before model reload
 
 ### 🐳 Docker System Optimizations
-|- **ComfyUI Arguments**: Optimized startup arguments for better performance
-|- **Flash Attention 2**: Enabled for 2-3x speedup on compatible hardware
-|- **Experimental Features**: Added validated arguments (`--async-offload`, `--reserve-vram 2`)
-|- **Version Compatibility**: Resolved version-specific argument differences
+- **ComfyUI Arguments**: Optimized startup arguments for better performance
+- **Flash Attention 2**: Enabled for 2-3x speedup on compatible hardware
+- **Experimental Features**: Added validated arguments (`--async-offload`, `--reserve-vram 2`)
+- **Version Compatibility**: Resolved version-specific argument differences
 
 ### **keep_model_loaded Enhancement**
 ### 🔧 keep_model_loaded Enhancement
-|- **Missing Parameter**: Added `keep_model_loaded` to PromptEnhancer node
-|- **Consistent Behavior**: Both GGUF and PromptEnhancer now have identical memory management
-|- **Conditional Cleanup**: Proper cleanup based on `keep_model_loaded` setting
-|- **User Control**: Full control over memory usage vs performance
+- **Missing Parameter**: Added `keep_model_loaded` to PromptEnhancer node
+- **Consistent Behavior**: Both GGUF and PromptEnhancer now have identical memory management
+- **Conditional Cleanup**: Proper cleanup based on `keep_model_loaded` setting
+- **User Control**: Full control over memory usage vs performance
 
 ### 🐳 Docker Final Optimization
-|- **Complete Build**: All fixes integrated into final Docker build
-|- **Flash Attention 2 Ready**: Performance optimizations included
-|- **Debug Enhanced**: Comprehensive logging for troubleshooting
-|- **Production Ready**: Stable and optimized for deployment
+- **Complete Build**: All fixes integrated into final Docker build
+- **Flash Attention 2 Ready**: Performance optimizations included
+- **Debug Enhanced**: Comprehensive logging for troubleshooting
+- **Production Ready**: Stable and optimized for deployment
 
 ### 📋 Files Modified
 **Node Files:**
-|- `AILab_QwenVL_GGUF.py`: Batch processing + enhanced cleanup
-|- `AILab_QwenVL_GGUF_PromptEnhancer.py`: keep_model_loaded + cleanup
+- `AILab_QwenVL_GGUF.py`: Batch processing + enhanced cleanup
+- `AILab_QwenVL_GGUF_PromptEnhancer.py`: keep_model_loaded + cleanup
 
 **Docker System Files:**
-|- `runpod/Dockerfile`: Flash Attention 2 + optimized ComfyUI arguments
-|- `runpod/Dockerfile.4090`: Flash Attention 2 + optimized ComfyUI arguments
+- `runpod/Dockerfile`: Flash Attention 2 + optimized ComfyUI arguments
+- `runpod/Dockerfile.4090`: Flash Attention 2 + optimized ComfyUI arguments
 
 ### 🎯 Impact
-|- **T2V/I2V Workflows**: Now fully functional with batch processing
-|- **Same Model Reuse**: No more conflicts between nodes
-|- **Performance**: 2-3x faster with Flash Attention 2
-|- **Stability**: Robust memory management and cleanup
-|- **Production**: Ready for deployment with all optimizations
+- **T2V/I2V Workflows**: Now fully functional with batch processing
+- **Same Model Reuse**: No more conflicts between nodes
+- **Performance**: 2-3x faster with Flash Attention 2
+- **Stability**: Robust memory management and cleanup
+- **Production**: Ready for deployment with all optimizations
 
 ## Version 2.2.1 (2026/02/18)
 
